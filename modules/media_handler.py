@@ -7,12 +7,21 @@ def load_image(path):
     return Image.open(path)
 
 def play_audio(path):
-    """Play an audio file (wav/mp3/ogg)."""
+    """Play an audio file (wav/mp3/ogg/opus)."""
     audio = AudioSegment.from_file(path)
-    play_obj = sa.play_buffer(
-        audio.raw_data,
-        num_channels=audio.channels,
-        bytes_per_sample=audio.sample_width,
-        sample_rate=audio.frame_rate
-    )
-    play_obj.wait_done()
+    # Export to WAV bytes in memory
+    import io
+    wav_io = io.BytesIO()
+    audio.export(wav_io, format="wav")
+    wav_io.seek(0)
+    # Play using simpleaudio
+    import wave
+    with wave.open(wav_io, 'rb') as wf:
+        data = wf.readframes(wf.getnframes())
+        play_obj = sa.play_buffer(
+            data,
+            num_channels=wf.getnchannels(),
+            bytes_per_sample=wf.getsampwidth(),
+            sample_rate=wf.getframerate()
+        )
+        play_obj.wait_done()
