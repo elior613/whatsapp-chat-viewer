@@ -1,16 +1,126 @@
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QPushButton, QVBoxLayout, QWidget,
-    QScrollArea, QHBoxLayout, QLabel, QSizePolicy, QToolButton
+    QScrollArea, QHBoxLayout, QLabel, QSizePolicy, QSlider
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt, QTimer
 from modules.chat_parser import parse_chat_file
-from modules.media_handler import load_image, play_audio
+from modules.media_handler import play_audio, stop_audio
 import os
 
+
+# WhatsApp-style audio bubble widget
+
+class AudioBubble(QWidget):
+    _current_audio = None  # Class variable to track currently playing audio
+
+    def __init__(self, sender, time, audio_path, duration, is_own=False):
+        super().__init__()
+        self.audio_path = audio_path
+        self.duration = duration
+        self.is_playing = False
+        self.timer = QTimer(self)
+        self.timer.setInterval(500)
+        self.timer.timeout.connect(self.update_progress)
+        self.progress = 0
+        self._seeking = False
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(10, 2, 10, 2)
+        layout.setSpacing(8)
+
+        self.play_btn = QPushButton()
+        self.play_btn.setText('▶')
+        self.play_btn.setFixedSize(32, 32)
+        self.play_btn.setStyleSheet('border-radius: 16px; background: #ece5dd; font-size: 18px;')
+        self.play_btn.clicked.connect(self.toggle_play)
+        layout.addWidget(self.play_btn)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(int(duration * 1000))
+        self.slider.setValue(0)
+        self.slider.setSingleStep(1000)
+        self.slider.setPageStep(5000)
+        self.slider.setFixedWidth(180)
+        self.slider.setStyleSheet('QSlider::groove:horizontal {height: 6px; background: #ddd; border-radius: 3px;} QSlider::handle:horizontal {background: #25d366; border: 1px solid #25d366; width: 12px; margin: -4px 0; border-radius: 6px;}')
+        self.slider.sliderPressed.connect(self.start_seek)
+        self.slider.sliderReleased.connect(self.end_seek)
+        self.slider.sliderMoved.connect(self.seek_preview)
+        layout.addWidget(self.slider)
+
+        self.time_label = QLabel(self.format_time(0) + ' / ' + self.format_time(duration))
+        self.time_label.setStyleSheet("font-size: 11px; color: #888;")
+        layout.addWidget(self.time_label)
+
+        layout.addStretch()
+
+        self.setLayout(layout)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+    def format_time(self, seconds):
+        m, s = divmod(int(seconds), 60)
+        return f"{m}:{s:02d}"
+
+    def toggle_play(self):
+        if self.is_playing:
+            self.pause_audio()
+        else:
+            self.play_audio(from_pos=self.progress)
+
+    def play_audio(self, from_pos=0):
+        # Stop any other audio bubble and any previous process for this bubble
+        if AudioBubble._current_audio and AudioBubble._current_audio is not self:
+            AudioBubble._current_audio.pause_audio()
+        AudioBubble._current_audio = self
+        # Stop all previous ffplay processes
+        from modules.media_handler import stop_audio, start_ffplay
+        stop_audio()
+        self._proc = start_ffplay(self.audio_path, from_pos=from_pos)
+        self.is_playing = True
+        self.play_btn.setText('⏸')
+        self.timer.start()
+
+    def pause_audio(self):
+        # Stop this bubble's process if running
+        if hasattr(self, '_proc') and self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
+        stop_audio()
+        self.is_playing = False
+        self.play_btn.setText('▶')
+        self.timer.stop()
+
+    def update_progress(self):
+        if self.is_playing and not self._seeking:
+            self.progress += 500
+            if self.progress >= self.duration * 1000:
+                self.progress = self.duration * 1000
+                self.pause_audio()
+            self.slider.setValue(int(self.progress))
+            self.time_label.setText(self.format_time(self.progress/1000) + ' / ' + self.format_time(self.duration))
+
+    def start_seek(self):
+        self._seeking = True
+
+    def seek_preview(self, value):
+        # Update label while dragging
+        self.time_label.setText(self.format_time(value/1000) + ' / ' + self.format_time(self.duration))
+
+    def end_seek(self):
+        self.progress = self.slider.value()
+        self._seeking = False
+        if self.is_playing:
+            self.play_audio(from_pos=self.progress)
+
+    def stop(self):
+        self.pause_audio()
+
 class ChatBubble(QWidget):
-    def __init__(self, sender, text, time, is_own=False, media=None, media_type=None, media_dir=None):
+    def __init__(self, sender, text, time, is_own=False):
         super().__init__()
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 2, 10, 2)
@@ -25,56 +135,20 @@ class ChatBubble(QWidget):
         time_label.setAlignment(Qt.AlignRight)
         layout.addWidget(sender_label)
         layout.addWidget(text_label)
-        # Media rendering
-        if media and media_type:
-            media_path = os.path.join(media_dir, media) if media_dir else media
-            print(f"[DEBUG] Trying to load media: {media_path} (type: {media_type})", flush=True)
-            if media_type == "image":
-                try:
-                    pixmap = QPixmap(media_path)
-                    img_label = QLabel()
-                    img_label.setPixmap(pixmap.scaledToWidth(200, Qt.SmoothTransformation))
-                    img_label.setStyleSheet("margin-top: 6px; margin-bottom: 6px; border-radius: 8px;")
-                    layout.addWidget(img_label)
-                except Exception as e:
-                    print(f"[ERROR] Failed to load image: {media_path} | {e}", flush=True)
-                    err_label = QLabel(f"[Image not found: {media}]")
-                    layout.addWidget(err_label)
-            elif media_type == "audio":
-                import threading
-                audio_btn = QToolButton()
-                audio_btn.setText("▶️ Play Voice")
-                def play():
-                    from PySide6.QtWidgets import QMessageBox
-                    import traceback
-                    def play_in_thread():
-                        try:
-                            print(f"[DEBUG] Playing audio: {media_path}", flush=True)
-                            play_audio(media_path)
-                            print(f"[DEBUG] Audio playback finished: {media_path}", flush=True)
-                        except Exception as e:
-                            tb = traceback.format_exc()
-                            print(f"[ERROR] Failed to play audio: {media_path} | {e}\n{tb}", flush=True)
-                            def show_error():
-                                msg_box = QMessageBox()
-                                msg_box.setIcon(QMessageBox.Critical)
-                                msg_box.setWindowTitle("Audio Playback Error")
-                                msg_box.setText(f"Failed to play audio file:\n{media_path}\n\nError: {e}\n\nTraceback:\n{tb}")
-                                msg_box.setDetailedText(tb)
-                                msg_box.exec()
-                            from PySide6.QtCore import QTimer
-                            QTimer.singleShot(0, show_error)
-                    threading.Thread(target=play_in_thread, daemon=True).start()
-                audio_btn.clicked.connect(play)
-                layout.addWidget(audio_btn)
         layout.addWidget(time_label)
         self.setLayout(layout)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
+class ChatViewerMainWindow(QMainWindow):
+    def closeEvent(self, event):
+        from modules.media_handler import stop_audio
+        stop_audio()
+        super().closeEvent(event)
+
 class ChatViewerApp:
     def __init__(self):
         self.app = QApplication([])
-        self.window = QMainWindow()
+        self.window = ChatViewerMainWindow()
         self.window.setWindowTitle("WhatsApp Chat Viewer")
         # Set chat background color (light gray)
         self.window.setStyleSheet("background-color: #ece5dd;")
@@ -93,12 +167,10 @@ class ChatViewerApp:
         container = QWidget()
         container.setLayout(layout)
         self.window.setCentralWidget(container)
-        self.media_dir = None
 
     def open_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self.window, "Open WhatsApp Chat", "", "Text Files (*.txt)")
         if file_path:
-            self.media_dir = os.path.dirname(file_path)
             messages = parse_chat_file(file_path)
             # Clear previous chat
             for i in reversed(range(self.chat_layout.count())):
@@ -110,10 +182,44 @@ class ChatViewerApp:
                     sender = msg.get('sender', 'Unknown')
                     time = msg.get('time', '')
                     text = msg.get('text', '')
-                    media = msg.get('media')
-                    media_type = msg.get('media_type')
                     is_own = (sender.strip() == "אליאור טקאץ'")
-                    bubble = ChatBubble(sender, text, time, is_own, media, media_type, self.media_dir)
+
+                    # Show audio bubble if media_type is audio
+                    if msg.get('media_type') == 'audio' and msg.get('media'):
+                        audio_path = msg['media']
+                        if not os.path.isabs(audio_path):
+                            audio_path = os.path.join(os.path.dirname(file_path), audio_path)
+                        duration = 20
+                        try:
+                            from pydub.utils import mediainfo
+                            info = mediainfo(audio_path)
+                            duration = float(info['duration'])
+                        except Exception:
+                            pass
+                        bubble = AudioBubble(sender, time, audio_path, duration, is_own)
+                    # Show image if media_type is image
+                    elif msg.get('media_type') == 'image' and msg.get('media'):
+                        from modules.media_handler import load_image
+                        image_path = msg['media']
+                        if not os.path.isabs(image_path):
+                            image_path = os.path.join(os.path.dirname(file_path), image_path)
+                        image_widget = QLabel()
+                        try:
+                            from PySide6.QtGui import QPixmap
+                            img = load_image(image_path)
+                            qimg = QPixmap(image_path)
+                            # Optionally scale for chat bubble size
+                            qimg = qimg.scaledToWidth(200, Qt.SmoothTransformation)
+                            image_widget.setPixmap(qimg)
+                        except Exception as e:
+                            image_widget.setText(f"[Image not found: {os.path.basename(image_path)}]")
+                        # Compose a bubble with image and text
+                        bubble = ChatBubble(sender, text, time, is_own)
+                        # Insert image above text
+                        bubble.layout().insertWidget(1, image_widget)
+                    else:
+                        bubble = ChatBubble(sender, text, time, is_own)
+
                     row = QHBoxLayout()
                     row.setContentsMargins(0, 0, 0, 0)
                     if is_own:
